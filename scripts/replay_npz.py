@@ -3,7 +3,9 @@
 .. code-block:: bash
 
     # Usage
-    python replay_motion.py --motion_file source/whole_body_tracking/whole_body_tracking/assets/g1/motions/lafan_walk_short.npz
+    python scripts/replay_npz.py --motion_file /home/user/rl_ws/src/whole_body_tracking/artifacts/run1_subject2/motion_origin.npz
+    python scripts/replay_npz.py --motion_file /home/user/rl_ws/src/whole_body_tracking/artifacts/run1_subject2/motion.npz \\
+        --xy_scale 0.5 --zero_origin --anchor_index 0
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -14,9 +16,24 @@ import torch
 
 from isaaclab.app import AppLauncher
 
+"""
+
+"""
+
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb registry.")
+parser.add_argument("--motion_file", type=str, default=None, help="Path to a local motion.npz file.")
+parser.add_argument("--xy_scale", type=float, default=1.0, help="Scale XY positions (and lin vel) by this factor.")
+parser.add_argument("--zero_origin", action="store_true", default=False, help="Subtract initial anchor XY to zero.")
+parser.add_argument("--anchor_index", type=int, default=0, help="Anchor body index for zero_origin (default: 0).")
+parser.add_argument("--pos_scale", type=float, default=1.0, help="Scale positions (and lin vel) by this factor.")
+parser.add_argument(
+    "--pos_scale_xy_only",
+    action="store_true",
+    default=False,
+    help="If set, only scale XY of positions (and lin vel).",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -58,8 +75,10 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
     )
 
     # articulation
-    robot: ArticulationCfg = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-
+    robot: ArticulationCfg = G1_CYLINDER_CFG.replace(
+        prim_path="{ENV_REGEX_NS}/Robot",
+        spawn=G1_CYLINDER_CFG.spawn.replace(activate_contact_sensors=False),
+    )
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Extract scene entities
@@ -67,16 +86,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
 
-    registry_name = args_cli.registry_name
-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
-        registry_name += ":latest"
-    import pathlib
+    if args_cli.motion_file:
+        motion_file = args_cli.motion_file
+    else:
+        if args_cli.registry_name is None:
+            raise RuntimeError("Either --motion_file or --registry_name must be provided.")
+        registry_name = args_cli.registry_name
+        if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
+            registry_name += ":latest"
+        import pathlib
+        import wandb
 
-    import wandb
-
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
 
     motion = MotionLoader(
         motion_file,
@@ -84,6 +107,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         sim.device,
     )
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
+    anchor_xy0 = None
+    if args_cli.zero_origin:
+        if not (0 <= args_cli.anchor_index < motion.body_pos_w.shape[1]):
+            raise IndexError(
+                f"anchor_index {args_cli.anchor_index} out of range for body_pos_w shape {motion.body_pos_w.shape}"
+            )
+        anchor_xy0 = motion.body_pos_w[0, args_cli.anchor_index, :2].clone()
+        if args_cli.xy_scale != 1.0:
+            anchor_xy0 = anchor_xy0 * args_cli.xy_scale
+        if args_cli.pos_scale != 1.0:
+            if args_cli.pos_scale_xy_only:
+                anchor_xy0 = anchor_xy0 * args_cli.pos_scale
+            else:
+                anchor_xy0 = anchor_xy0 * args_cli.pos_scale
 
     # Simulation loop
     while simulation_app.is_running():
@@ -92,9 +129,24 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         time_steps[reset_ids] = 0
 
         root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins[:, None, :]
+        body_pos = motion.body_pos_w[time_steps].clone()
+        body_lin_vel = motion.body_lin_vel_w[time_steps].clone()
+        if args_cli.xy_scale != 1.0:
+            body_pos[..., :2] = body_pos[..., :2] * args_cli.xy_scale
+            body_lin_vel[..., :2] = body_lin_vel[..., :2] * args_cli.xy_scale
+        if args_cli.pos_scale != 1.0:
+            if args_cli.pos_scale_xy_only:
+                body_pos[..., :2] = body_pos[..., :2] * args_cli.pos_scale
+                body_lin_vel[..., :2] = body_lin_vel[..., :2] * args_cli.pos_scale
+            else:
+                body_pos = body_pos * args_cli.pos_scale
+                body_lin_vel = body_lin_vel * args_cli.pos_scale
+        if anchor_xy0 is not None:
+            body_pos[..., :2] = body_pos[..., :2] - anchor_xy0
+
+        root_states[:, :3] = body_pos[:, 0] + scene.env_origins[:, None, :]
         root_states[:, 3:7] = motion.body_quat_w[time_steps][:, 0]
-        root_states[:, 7:10] = motion.body_lin_vel_w[time_steps][:, 0]
+        root_states[:, 7:10] = body_lin_vel[:, 0]
         root_states[:, 10:] = motion.body_ang_vel_w[time_steps][:, 0]
 
         robot.write_root_state_to_sim(root_states)
@@ -109,7 +161,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 def main():
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
-    sim_cfg.dt = 0.02
+    sim_cfg.dt = 1.0 / 30.0
     sim = SimulationContext(sim_cfg)
 
     scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)

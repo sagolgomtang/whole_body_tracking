@@ -3,14 +3,16 @@
 .. code-block:: bash
 
     # Usage
-    python csv_to_npz.py --input_file LAFAN/dance1_subject2.csv --input_fps 30 --frame_range 122 722 \
-    --output_file ./motions/dance1_subject2.npz --output_fps 50
+python scripts/csv_to_npz.py --input_file /home/user/rl_ws/src/GMR/gmr_result/unitree_g1/csv/aiming1_subject4.csv --input_fps 30 --headless
+
 """
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
 import numpy as np
+from pathlib import Path
+import os
 
 from isaaclab.app import AppLauncher
 
@@ -28,14 +30,21 @@ parser.add_argument(
         " loaded."
     ),
 )
-parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
-parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
 
-# append AppLauncher cli args
+parser.add_argument("--output_name", type=str, default=None, help="The name of the motion npz file.")
+parser.add_argument("--output_fps", type=int, default=30, help="The fps of the output motion.")
+parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the output npz file.")
+parser.add_argument("--no_wandb", action="store_true", default=False, help="Disable W&B upload/logging.")
+
+# append AppLauncher cli args (여기서 --headless 포함 여러 옵션이 자동 추가됨)
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
+
+# parse the arguments (한 번만)
 args_cli = parser.parse_args()
 
+# default output_name = input filename stem
+if args_cli.output_name is None:
+    args_cli.output_name = Path(args_cli.input_file).stem
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -57,6 +66,19 @@ from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, 
 ##
 from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
 
+def safe_sim_app_close(simulation_app) -> None:
+    """Close Isaac Sim app quickly without hanging."""
+    import threading
+
+    def _close():
+        try:
+            simulation_app.close()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_close, daemon=True)
+    t.start()
+    t.join(0.05)  # 고정: 50ms만 기다리고 진행
 
 @configclass
 class ReplayMotionsSceneCfg(InteractiveSceneCfg):
@@ -75,8 +97,10 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
     )
 
     # articulation
-    robot: ArticulationCfg = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-
+    robot: ArticulationCfg = G1_CYLINDER_CFG.replace(
+        prim_path="{ENV_REGEX_NS}/Robot",
+        spawn=G1_CYLINDER_CFG.spawn.replace(activate_contact_sensors=False),
+    )
 
 class MotionLoader:
     def __init__(
@@ -240,11 +264,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
         "body_lin_vel_w": [],
         "body_ang_vel_w": [],
     }
-    file_saved = False
     # --------------------------------------------------------------------------
 
-    # Simulation loop
-    while simulation_app.is_running():
+    # headless에서 무한루프 방지: 한 사이클(= output_frames)만 돌린다
+    max_frames = motion.output_frames
+    frame_count = 0
+
+    while simulation_app.is_running() and frame_count < max_frames:
         (
             (
                 motion_base_pos,
@@ -272,44 +298,59 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
         joint_pos[:, robot_joint_indexes] = motion_dof_pos
         joint_vel[:, robot_joint_indexes] = motion_dof_vel
         robot.write_joint_state_to_sim(joint_pos, joint_vel)
+
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim.get_physics_dt())
 
         pos_lookat = root_states[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
 
-        if not file_saved:
-            log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
-            log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
-            log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
-            log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
-            log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
-            log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+        # log current frame
+        log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
+        log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
+        log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
+        log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
+        log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
+        log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
 
-        if reset_flag and not file_saved:
-            file_saved = True
-            for k in (
-                "joint_pos",
-                "joint_vel",
-                "body_pos_w",
-                "body_quat_w",
-                "body_lin_vel_w",
-                "body_ang_vel_w",
-            ):
-                log[k] = np.stack(log[k], axis=0)
+        frame_count += 1
 
-            np.savez("/tmp/motion.npz", **log)
+        # 한 사이클 끝나면 저장/업로드하고 즉시 종료
+        if reset_flag:
+            break
 
-            import wandb
+    # stack & save
+    for k in (
+        "joint_pos",
+        "joint_vel",
+        "body_pos_w",
+        "body_quat_w",
+        "body_lin_vel_w",
+        "body_ang_vel_w",
+    ):
+        log[k] = np.stack(log[k], axis=0)
 
-            COLLECTION = args_cli.output_name
-            run = wandb.init(project="csv_to_npz", name=COLLECTION)
-            print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-            REGISTRY = "motions"
-            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
-            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
-            print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+    output_dir = args_cli.output_dir or "."
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{args_cli.output_name}.npz")
+    np.savez(output_path, **log)
+    print(f"[INFO]: Saved motion npz: {output_path}")
 
+    if not args_cli.no_wandb:
+        import wandb
+
+        COLLECTION = args_cli.output_name
+        run = wandb.init(project="csv_to_npz", name=COLLECTION)
+        print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
+
+        REGISTRY = "motions"
+        logged_artifact = run.log_artifact(artifact_or_path=output_path, name=COLLECTION, type=REGISTRY)
+        run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
+        print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+
+        run.finish()
+    # close sim app to avoid hanging
+    safe_sim_app_close(simulation_app)
 
 def main():
     """Main function."""
@@ -363,7 +404,10 @@ def main():
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
-    simulation_app.close()
+
+    # try to close kit cleanly (avoid hanging forever)
+    safe_sim_app_close(simulation_app)
+
+    import sys
+    sys.exit(0)

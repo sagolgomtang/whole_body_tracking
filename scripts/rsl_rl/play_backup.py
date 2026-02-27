@@ -1,10 +1,17 @@
-# Copyright (c) 2022-2024, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""Script to play a checkpoint if an RL agent from RSL-RL."""
 
-"""Script to train RL agent with RSL-RL."""
 """Launch Isaac Sim Simulator first."""
+"""
+excution example:
+
+python scripts/rsl_rl/play.py \
+    --task Tracking-Flat-G1-v0 \
+    --num_envs 2 \
+    --wandb_path joony/tracking_g1/0pms9g8m/model_best.pt \
+    --motion_file /home/user/rl_ws/src/whole_body_tracking/artifacts/aiming2_subject2/motion.npz
+
+"""
+
 
 import argparse
 import sys
@@ -15,27 +22,15 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser = argparse.ArgumentParser(description="Play an RL agent with RSL-RL.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument(
+    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
-parser.add_argument(
-    "--registry_name",
-    type=str,
-    default=None,
-    help="The name of the wand registry (used if --motion_file is not provided).",
-)
-parser.add_argument(
-    "--motion_file",
-    type=str,
-    default=None,
-    help="Path to a local motion.npz (overrides --registry_name).",
-)
-
+parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -243,19 +238,43 @@ if ENABLE_G1_PATCH:
 else:
     print("[G1 PATCH] Disabled (non-g1 task).")
 
-# =============================================================================
-# NOTE:
-# - 기존에 있던 "retry(update) 패치"는 G1 인스턴스/prototype 문제와 충돌/중복될 수 있어서 제거했습니다.
-# - URDF async 타이밍 문제를 꼭 같이 잡아야 하면, 아래 Rest 이후에 '선택적으로' retry를 덧붙이세요.
-# =============================================================================
-
 
 """Rest everything follows."""
 
 import gymnasium as gym
 import os
+import pathlib
 import torch
-from datetime import datetime
+
+from rsl_rl.runners import OnPolicyRunner
+
+# =============================================================================
+# [PLAY HOTFIX] PPO signature mismatch (runner passes lcp_cfg/bound_loss_cfg)
+#   - Some runner versions always pass lcp_cfg/bound_loss_cfg to PPO(...)
+#   - Some PPO implementations don't accept those kwargs -> TypeError
+#   - Patch PPO.__init__ to ignore them (play-only).
+# =============================================================================
+import inspect
+
+try:
+    import rsl_rl.algorithms.ppo as _ppo_mod
+
+    _sig = inspect.signature(_ppo_mod.PPO.__init__)
+    if "lcp_cfg" not in _sig.parameters:
+        _orig_ppo_init = _ppo_mod.PPO.__init__
+
+        def _patched_ppo_init(self, *args, lcp_cfg=None, bound_loss_cfg=None, **kwargs):
+            # Ignore lcp_cfg / bound_loss_cfg for compatibility
+            return _orig_ppo_init(self, *args, **kwargs)
+
+        _ppo_mod.PPO.__init__ = _patched_ppo_init
+        print("[PLAY HOTFIX] Patched rsl_rl.algorithms.ppo.PPO.__init__ to ignore lcp_cfg/bound_loss_cfg")
+    else:
+        print("[PLAY HOTFIX] PPO already supports lcp_cfg (no patch needed).")
+
+except Exception as _e:
+    print(f"[PLAY HOTFIX] PPO patch skipped: {_e}")
+
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -265,66 +284,95 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
-from whole_body_tracking.utils.my_on_policy_runner import MotionOnPolicyRunner as OnPolicyRunner
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = False
+from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
-    """Train with RSL-RL agent."""
-    # override configurations with non-hydra CLI arguments
-    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    """Play with RSL-RL agent."""
+    agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    agent_cfg.max_iterations = (
-        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
-    )
-
-    # set the environment seed
-    env_cfg.seed = agent_cfg.seed
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-
-    # load the motion file (local path takes precedence over W&B registry)
-    registry_name = args_cli.registry_name
-    if args_cli.motion_file:
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
-        print(f"[INFO] Using motion file from CLI: {env_cfg.commands.motion.motion_file}")
-        if registry_name is None:
-            registry_name = "local"
-    else:
-        if registry_name is None:
-            raise RuntimeError("Either --motion_file or --registry_name must be provided.")
-        if ":" not in registry_name:
-            registry_name += ":latest"
-
-        import pathlib
-        import wandb
-
-        api = wandb.Api()
-        artifact = api.artifact(registry_name)
-        env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
-        print(f"[INFO] Using motion file from W&B registry: {env_cfg.commands.motion.motion_file}")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
+    resume_path = None
+
+    if args_cli.wandb_path:
+        import wandb
+
+        run_path = args_cli.wandb_path
+
+        api = wandb.Api()
+        if "model" in args_cli.wandb_path:
+            run_path = "/".join(args_cli.wandb_path.split("/")[:-1])
+
+        wandb_run = api.run(run_path)
+
+        # loop over files in the run
+        files = [f.name for f in wandb_run.files() if "model" in f.name]
+
+        if "model" in args_cli.wandb_path:
+            file = args_cli.wandb_path.split("/")[-1]
+        else:
+            # 1) prefer model_best.pt if exists
+            if "model_best.pt" in files:
+                file = "model_best.pt"
+            else:
+                # 2) otherwise pick largest model_####.pt
+                numeric = []
+                for x in files:
+                    if x.startswith("model_") and x.endswith(".pt"):
+                        token = x.split("_", 1)[1].split(".", 1)[0]  # part after 'model_'
+                        if token.isdigit():
+                            numeric.append((int(token), x))
+                if not numeric:
+                    raise RuntimeError(f"No numeric model_####.pt found in run files: {files}")
+                file = max(numeric, key=lambda t: t[0])[1]
+
+        wandb_file = wandb_run.file(str(file))
+        wandb_file.download("./logs/rsl_rl/temp", replace=True)
+
+        print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
+        resume_path = f"./logs/rsl_rl/temp/{file}"
+
+        # (1) Highest priority: CLI motion_file
+        if args_cli.motion_file is not None:
+            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
+            env_cfg.commands.motion.motion_file = args_cli.motion_file
+        else:
+            # (2) Try to load from W&B artifact (used or logged)
+            art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
+            if art is None:
+                art = next((a for a in wandb_run.logged_artifacts() if a.type == "motions"), None)
+
+            if art is None:
+                print("[WARN] No motions artifact found in the run. You must pass --motion_file.")
+            else:
+                # Expect motion.npz inside artifact
+                motion_path = pathlib.Path(art.download()) / "motion.npz"
+                env_cfg.commands.motion.motion_file = str(motion_path)
+                print(f"[INFO]: Using motion file from W&B artifact: {env_cfg.commands.motion.motion_file}")
+
+    else:
+        print(f"[INFO] Loading experiment from directory: {log_root_path}")
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+        # if user provided motion_file, apply it
+        if args_cli.motion_file is not None:
+            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
+            env_cfg.commands.motion.motion_file = args_cli.motion_file
+
+    if resume_path is None:
+        raise RuntimeError("resume_path is None. Provide --wandb_path or configure local checkpoint loading.")
 
     # create isaac environment
     try:
@@ -334,15 +382,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         dump_stage_robot_debug()
         raise
 
+    log_dir = os.path.dirname(resume_path)
+
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "train"),
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_folder": os.path.join(log_dir, "videos", "play"),
+            "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
         }
-        print("[INFO] Recording videos during training.")
+        print("[INFO] Recording videos during play.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
@@ -353,30 +403,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
-    # create runner from rsl-rl
-    runner = OnPolicyRunner(
-        env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_name
+    # load previously trained model
+    cfg = agent_cfg.to_dict()
+
+    # rsl_rl 최신쪽은 obs_groups 키가 없으면 KeyError로 죽음
+    # => 없으면 기본값으로 넣어준다.
+    cfg.setdefault("obs_groups", {})   # 또는 None을 원하면 cfg.setdefault("obs_groups", None)
+
+    ppo_runner = OnPolicyRunner(env, cfg, log_dir=None, device=agent_cfg.device)
+    ppo_runner.load(resume_path)
+
+    # obtain the trained policy for inference
+    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+
+    # export policy to onnx/jit
+    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    os.makedirs(export_model_dir, exist_ok=True)
+
+# --- normalizer may not exist depending on rsl_rl version ---
+    normalizer = getattr(ppo_runner, "obs_normalizer", None)
+
+    # some versions keep it inside the algorithm object
+    if normalizer is None:
+        normalizer = getattr(getattr(ppo_runner, "alg", None), "obs_normalizer", None)
+
+    # if still None, export without normalizer (exporter should handle None)
+    export_motion_policy_as_onnx(
+        env.unwrapped,
+        ppo_runner.alg.policy,
+        normalizer=normalizer,
+        path=export_model_dir,
+        filename="policy.onnx",
     )
 
-    # write git state to logs
-    runner.add_git_repo_to_log(__file__)
+    attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
 
-    # save resume path before creating a new log_dir
-    if agent_cfg.resume:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        runner.load(resume_path)
+    # reset environment
+    obs, _ = env.get_observations()
+    timestep = 0
 
-    # dump the configuration into log-directory
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-    dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
-    dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+    # simulate environment
+    while simulation_app.is_running():
+        with torch.inference_mode():
+            actions = policy(obs)
+            obs, _, _, _ = env.step(actions)
 
-    # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+        if args_cli.video:
+            timestep += 1
+            if timestep >= args_cli.video_length:
+                break
 
-    # close the simulator
     env.close()
 
 

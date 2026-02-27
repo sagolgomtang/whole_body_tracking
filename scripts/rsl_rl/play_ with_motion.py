@@ -13,8 +13,8 @@ python scripts/rsl_rl/play.py \
 python scripts/rsl_rl/play.py \
     --task Tracking-Flat-G1-v0 \
     --num_envs 1 \
-    --wandb_path /home/user/rl_ws/src/whole_body_tracking/logs/rsl_rl/g1_flat/2026-01-27_15-57-51_run1_subject2/model_best.pt \
-    --motion_file /home/user/rl_ws/src/whole_body_tracking/artifacts/run1_subject2/motion_origin.npz \
+    --wandb_path /home/user/rl_ws/src/whole_body_tracking/logs/rsl_rl/g1_flat/2026-01-01_06-58-10_walk2_subject4/model_best.pt \
+    --motion_file /home/user/rl_ws/src/whole_body_tracking/artifacts/walk2_subject4/motion.npz \
     --headless --export_only
 """
 
@@ -36,25 +36,51 @@ parser.add_argument("--disable_fabric", action="store_true", default=False, help
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
-parser.add_argument("--export_only", action="store_true", default=False, help="Only export ONNX and exit.")
 parser.add_argument(
-    "--log_termination",
+    "--follow_camera",
     action="store_true",
     default=False,
-    help="Log which termination terms fired during play.",
+    help="Follow the robot with the viewer camera (default: free camera).",
 )
 parser.add_argument(
-    "--log_termination_env_id",
+    "--replay_motion_file",
+    type=str,
+    default=None,
+    help="Path to a motion file to replay as markers in the same sim.",
+)
+parser.add_argument(
+    "--replay_registry_name",
+    type=str,
+    default=None,
+    help="W&B registry name for a motion artifact (e.g. myorg/motions:latest).",
+)
+parser.add_argument("--replay_env_id", type=int, default=0, help="Env index for replay visualization.")
+parser.add_argument("--replay_stride", type=int, default=1, help="Stride for replay motion frames.")
+parser.add_argument(
+    "--replay_anchor_index",
     type=int,
     default=0,
-    help="Environment index to log termination reasons for.",
+    help="Body index in motion file used as alignment anchor (default: 0).",
 )
 parser.add_argument(
-    "--disable_terminations",
+    "--replay_motion_is_world",
     action="store_true",
     default=False,
-    help="Disable all termination conditions during play.",
+    help="Motion positions are already in world frame (no env_origin offset).",
 )
+parser.add_argument(
+    "--replay_no_yaw_align",
+    action="store_true",
+    default=False,
+    help="Disable yaw alignment when overlaying replay markers.",
+)
+parser.add_argument(
+    "--replay_use_command_time",
+    action="store_true",
+    default=False,
+    help="Use MotionCommand time_steps for replay timing (sync with policy target).",
+)
+parser.add_argument("--export_only", action="store_true", default=False, help="Only export ONNX and exit.")
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -297,18 +323,108 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from whole_body_tracking.tasks.tracking.mdp import MotionLoader
+
+
+def _resolve_replay_motion_file() -> str | None:
+    if args_cli.replay_registry_name:
+        import pathlib
+        import wandb
+
+        registry_name = args_cli.replay_registry_name
+        if ":" not in registry_name:
+            registry_name += ":latest"
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_path = pathlib.Path(artifact.download()) / "motion.npz"
+        return str(motion_path)
+
+    if args_cli.replay_motion_file:
+        return args_cli.replay_motion_file
+
+    return None
+
+
+def _setup_replay_visualizers(env, motion_file: str):
+    import numpy as np
+    import torch
+    from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+    from isaaclab.markers.config import FRAME_MARKER_CFG
+
+    data = np.load(motion_file)
+    body_count = int(data["body_pos_w"].shape[1])
+    body_indexes = torch.arange(body_count, device=env.device, dtype=torch.long)
+    motion = MotionLoader(motion_file, body_indexes, device=env.device)
+
+    replay_body_visualizers = []
+    for i in range(body_count):
+        marker_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(
+            prim_path=f"/Visuals/Replay/body_{i}"
+        )
+        marker_cfg.markers["frame"].scale = (0.08, 0.08, 0.08)
+        replay_body_visualizers.append(VisualizationMarkers(marker_cfg))
+
+    replay_state = {
+        "motion": motion,
+        "time_step": 0,
+        "body_visualizers": replay_body_visualizers,
+        "aligned": False,
+        "delta_pos": None,
+        "delta_ori": None,
+    }
+    return replay_state
+
+
+def _align_replay_to_robot(base_env, replay_state):
+    import torch
+    from isaaclab.utils.math import quat_apply, quat_inv, quat_mul, yaw_quat
+
+    motion = replay_state["motion"]
+    time_step = 0
+
+    robot = base_env.scene["robot"]
+    robot_anchor_body_index = 0
+    command = None
+    try:
+        command = base_env.command_manager.get_term("motion")
+        robot_anchor_body_index = int(command.robot_anchor_body_index)
+    except Exception:
+        pass
+
+    robot_anchor_pos = robot.data.body_pos_w[args_cli.replay_env_id, robot_anchor_body_index]
+    robot_anchor_quat = robot.data.body_quat_w[args_cli.replay_env_id, robot_anchor_body_index]
+
+    if args_cli.replay_use_command_time and command is not None:
+        time_step = int(command.time_steps[args_cli.replay_env_id].item())
+
+    anchor_index = int(args_cli.replay_anchor_index)
+    env_origin = base_env.scene.env_origins[args_cli.replay_env_id]
+    anchor_pos = motion.body_pos_w[time_step, anchor_index]
+    anchor_quat = motion.body_quat_w[time_step, anchor_index]
+
+    if args_cli.replay_no_yaw_align:
+        delta_ori = torch.tensor([1.0, 0.0, 0.0, 0.0], device=robot_anchor_quat.device)
+    else:
+        delta_ori = yaw_quat(quat_mul(robot_anchor_quat, quat_inv(anchor_quat)))
+
+    if args_cli.replay_motion_is_world:
+        env_origin = torch.zeros_like(env_origin)
+
+    delta_pos = robot_anchor_pos - (quat_apply(delta_ori, anchor_pos) + env_origin)
+
+    replay_state["time_step"] = time_step
+    replay_state["delta_pos"] = delta_pos
+    replay_state["delta_ori"] = delta_ori
+    replay_state["aligned"] = True
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    if args_cli.disable_terminations:
-        # keep time_out only (if present), disable other termination terms
-        if hasattr(env_cfg.terminations, "time_out"):
-            env_cfg.terminations = {"time_out": env_cfg.terminations.time_out}
-        else:
-            env_cfg.terminations = {}
+    if not args_cli.follow_camera:
+        env_cfg.viewer.origin_type = "world"
+        env_cfg.viewer.asset_name = ""
 
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = None
@@ -421,6 +537,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     ppo_runner = OnPolicyRunner(env, cfg, log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
 
+    base_env = env.unwrapped
+    replay_state = None
+    replay_motion_file = _resolve_replay_motion_file()
+    if replay_motion_file is not None:
+        if args_cli.replay_env_id >= base_env.scene.num_envs:
+            print(
+                f"[REPLAY] replay_env_id={args_cli.replay_env_id} out of range "
+                f"(num_envs={base_env.scene.num_envs}); skipping replay."
+            )
+        else:
+            print(f"[REPLAY] Loading motion: {replay_motion_file}")
+            replay_state = _setup_replay_visualizers(base_env, replay_motion_file)
+
     # -----------------------------
     # export (NO PLAY)
     # -----------------------------
@@ -459,36 +588,58 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # play (optional)
     # -----------------------------
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
-    obs_out = env.get_observations()
-    if isinstance(obs_out, tuple) and len(obs_out) == 2:
-        obs, _ = obs_out
-    else:
-        obs = obs_out
+    obs, _ = env.get_observations()
+    if replay_state is not None and not replay_state["aligned"]:
+        _align_replay_to_robot(base_env, replay_state)
     timestep = 0
-
-    base_env = env.unwrapped
 
     while simulation_app.is_running():
         with torch.inference_mode():
             actions = policy(obs)
-            obs, _, dones, _ = env.step(actions)
+            obs, _, _, _ = env.step(actions)
 
-        if args_cli.log_termination and hasattr(base_env, "termination_manager"):
-            env_id = int(args_cli.log_termination_env_id)
-            try:
-                if dones[env_id]:
-                    tm = base_env.termination_manager
-                    active = tm.active_terms
-                    fired = []
-                    for name in active:
-                        if tm.get_term(name)[env_id].item():
-                            fired.append(name)
-                    print(
-                        f"[TERM] env={env_id} time_out={tm.time_outs[env_id].item()} "
-                        f"terminated={tm.terminated[env_id].item()} fired={fired}"
-                    )
-            except Exception as exc:
-                print(f"[TERM] failed to read termination info: {exc}")
+        try:
+            command = base_env.command_manager.get_term("motion")
+            err = command.anchor_pos_w - command.robot_anchor_pos_w
+            err_vec = err[args_cli.replay_env_id].detach().cpu().numpy().tolist()
+            print(f"[ANCHOR_ERR] env={args_cli.replay_env_id} vec={err_vec}")
+        except Exception as exc:
+            print(f"[ANCHOR_ERR] failed to read motion command: {exc}")
+
+        if replay_state is not None:
+            from isaaclab.utils.math import quat_apply, quat_mul
+
+            if not replay_state["aligned"]:
+                _align_replay_to_robot(base_env, replay_state)
+
+            motion = replay_state["motion"]
+            command = None
+            if args_cli.replay_use_command_time:
+                try:
+                    command = base_env.command_manager.get_term("motion")
+                except Exception:
+                    command = None
+
+            if args_cli.replay_use_command_time and command is not None:
+                t = int(command.time_steps[args_cli.replay_env_id].item())
+                replay_state["time_step"] = t
+            else:
+                t = replay_state["time_step"]
+            delta_pos = replay_state["delta_pos"]
+            delta_ori = replay_state["delta_ori"]
+            env_origin = base_env.scene.env_origins[args_cli.replay_env_id]
+            if args_cli.replay_motion_is_world:
+                env_origin = torch.zeros_like(env_origin)
+            pos = motion.body_pos_w[t]
+            delta_ori_b = delta_ori.unsqueeze(0).expand_as(motion.body_quat_w[t])
+            pos = delta_pos + quat_apply(delta_ori_b, pos) + env_origin
+            quat = quat_mul(delta_ori_b, motion.body_quat_w[t])
+            for i, vis in enumerate(replay_state["body_visualizers"]):
+                vis.visualize(pos[i].unsqueeze(0), quat[i].unsqueeze(0))
+            if not args_cli.replay_use_command_time:
+                replay_state["time_step"] = (
+                    replay_state["time_step"] + max(int(args_cli.replay_stride), 1)
+                ) % motion.time_step_total
 
         if args_cli.video:
             timestep += 1

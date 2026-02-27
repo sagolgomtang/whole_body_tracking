@@ -1,6 +1,6 @@
 from isaaclab.utils import configclass
 
-from whole_body_tracking.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
+from whole_body_tracking.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG, G1_CFG
 from whole_body_tracking.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
 from whole_body_tracking.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 
@@ -13,6 +13,8 @@ class G1FlatEnvCfg(TrackingEnvCfg):
         self.scene.robot = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.actions.joint_pos.scale = G1_ACTION_SCALE
         self.commands.motion.anchor_body_name = "torso_link"
+        self.commands.motion.anchor_xy_scale = 1.0
+        self.commands.motion.anchor_xy_zero_origin = True
         self.commands.motion.body_names = [
             "pelvis",
             "left_hip_roll_link",

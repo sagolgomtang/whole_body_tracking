@@ -72,6 +72,12 @@ class MotionCommand(CommandTerm):
         )
 
         self.motion = MotionLoader(self.cfg.motion_file, self.body_indexes, device=self.device)
+        self._anchor_xy_offset = torch.zeros(2, device=self.device)
+        if self.cfg.anchor_xy_zero_origin:
+            anchor_xy0 = self.motion._body_pos_w[0, self.motion_anchor_body_index, :2]
+            if self.cfg.anchor_xy_scale != 1.0:
+                anchor_xy0 = anchor_xy0 * self.cfg.anchor_xy_scale
+            self._anchor_xy_offset = anchor_xy0
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
@@ -111,7 +117,11 @@ class MotionCommand(CommandTerm):
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps] + self._env.scene.env_origins[:, None, :]
+        pos = self.motion.body_pos_w[self.time_steps]
+        if self.cfg.anchor_xy_scale != 1.0 or self.cfg.anchor_xy_zero_origin:
+            pos = pos.clone()
+            pos[..., 0:2] = pos[..., 0:2] * self.cfg.anchor_xy_scale - self._anchor_xy_offset
+        return pos + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
@@ -127,7 +137,14 @@ class MotionCommand(CommandTerm):
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
+        anchor_pos = self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index]
+        if self.cfg.anchor_xy_scale != 1.0:
+            anchor_pos = anchor_pos.clone()
+            anchor_pos[:, 0:2] = anchor_pos[:, 0:2] * self.cfg.anchor_xy_scale
+        if self.cfg.anchor_xy_zero_origin:
+            anchor_pos = anchor_pos.clone()
+            anchor_pos[:, 0:2] = anchor_pos[:, 0:2] - self._anchor_xy_offset
+        return anchor_pos + self._env.scene.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
@@ -135,7 +152,11 @@ class MotionCommand(CommandTerm):
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.time_steps, self.motion_anchor_body_index]
+        anchor_vel = self.motion.body_lin_vel_w[self.time_steps, self.motion_anchor_body_index]
+        if self.cfg.anchor_xy_scale != 1.0:
+            anchor_vel = anchor_vel.clone()
+            anchor_vel[:, 0:2] = anchor_vel[:, 0:2] * self.cfg.anchor_xy_scale
+        return anchor_vel
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
@@ -369,6 +390,8 @@ class MotionCommandCfg(CommandTermCfg):
     adaptive_lambda: float = 0.8
     adaptive_uniform_ratio: float = 0.1
     adaptive_alpha: float = 0.001
+    anchor_xy_scale: float = 1.0
+    anchor_xy_zero_origin: bool = False
 
     anchor_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
     anchor_visualizer_cfg.markers["frame"].scale = (0.2, 0.2, 0.2)
